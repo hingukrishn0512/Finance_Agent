@@ -1,15 +1,20 @@
+# LLM / agent
 langchain
-langchain-groq
-langgraph
-langchain-community
 langchain-core
+langchain-google-genai
+python-dotenv
+
+# Data
 yfinance
 requests
 numpy
 pandas
-matplotlib
-scikit-learn
-streamlit
-python-dotenv
+
+# ML / plotting
 tensorflow
-keras
+scikit-learn
+matplotlib
+
+# API
+fastapi
+uvicorn[standard]

@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stock Analysis Agent</title>
+<style>
+  :root {
+    --bg: #f2f4f7;
+    --surface: #ffffff;
+    --ink: #16212c;
+    --muted: #5d6b7a;
+    --line: #d9dfe6;
+    --accent: #2447c9;
+    --accent-ink: #ffffff;
+    --user: #e3e9fb;
+    --danger: #b3261e;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10161d;
+      --surface: #19212b;
+      --ink: #e8edf2;
+      --muted: #93a1b0;
+      --line: #2a3541;
+      --accent: #7f9bff;
+      --accent-ink: #0d1320;
+      --user: #223056;
+      --danger: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-variant-numeric: tabular-nums;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+  }
+  header h1 { font-size: 1.05rem; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  header button {
+    background: none; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 6px; padding: 4px 10px; font: inherit; font-size: 0.85rem; cursor: pointer;
+  }
+  header button:hover { color: var(--ink); border-color: var(--muted); }
+
+  main { flex: 1; overflow-y: auto; padding: 24px 16px 8px; }
+  .thread { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+
+  .empty h2 { font-size: 1.7rem; letter-spacing: -0.02em; margin: 24px 0 6px; line-height: 1.2; }
+  .empty p { color: var(--muted); margin: 0 0 18px; max-width: 52ch; }
+  .examples { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+  .examples button {
+    background: var(--surface); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 14px; font: inherit; cursor: pointer; text-align: left;
+  }
+  .examples button:hover { border-color: var(--accent); }
+
+  .msg { max-width: 100%; }
+  .msg.user {
+    align-self: flex-end; background: var(--user);
+    padding: 9px 14px; border-radius: 14px 14px 3px 14px; max-width: 85%;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .msg.bot { border-left: 3px solid var(--accent); padding-left: 14px; overflow-wrap: anywhere; }
+  .msg.bot.error { border-left-color: var(--danger); color: var(--danger); }
+  .msg.bot code { background: var(--surface); border: 1px solid var(--line); padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+  .msg.bot img {
+    display: block; width: 100%; height: auto; margin-top: 12px;
+    background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  }
+  .status { color: var(--muted); display: flex; align-items: center; gap: 10px; }
+  .dots span {
+    display: inline-block; width: 6px; height: 6px; margin-right: 3px; border-radius: 50%;
+    background: var(--accent); animation: blink 1.2s infinite ease-in-out;
+  }
+  .dots span:nth-child(2) { animation-delay: 0.2s; }
+  .dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .dots span { animation: none; opacity: 0.6; } }
+
+  form {
+    max-width: 760px; width: 100%; margin: 0 auto; padding: 12px 16px 18px;
+    display: flex; gap: 10px;
+  }
+  textarea {
+    flex: 1; resize: none; font: inherit; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; max-height: 140px;
+  }
+  textarea:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  form button {
+    background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 10px;
+    padding: 0 20px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  form button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .note { text-align: center; color: var(--muted); font-size: 0.8rem; padding: 0 16px 14px; margin: 0; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Stock Analysis Agent</h1>
+    <button id="clear" type="button">Clear chat</button>
+  </header>
+
+  <main id="scroll">
+    <div class="thread" id="thread">
+      <section class="empty" id="empty">
+        <h2>Ask about any stock</h2>
+        <p>Get prices, financials, ratios, trend analysis, news, comparisons, and a 7-day LSTM forecast. Follow-up questions work. For Indian stocks, add .NS (NSE) or .BO (BSE) to the ticker.</p>
+        <div class="examples">
+          <button type="button">What is the price of RELIANCE.NS?</button>
+          <button type="button">Give me a full analysis of TCS.NS</button>
+          <button type="button">Compare TCS.NS and INFY.NS</button>
+          <button type="button">Show graph and 7-day prediction for INFY.NS</button>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <form id="form" autocomplete="off">
+    <textarea id="input" rows="1" placeholder="Type a stock name or question" aria-label="Message"></textarea>
+    <button id="send" type="submit">Send</button>
+  </form>
+  <p class="note">Forecasts are rough estimates, not financial advice. Graph requests can take up to a minute.</p>
+
+<script>
+  // Same origin when served by FastAPI; falls back to localhost if opened as a file.
+  const API = location.protocol === "file:" ? "http://127.0.0.1:8000" : "";
+
+  const thread = document.getElementById("thread");
+  const scroller = document.getElementById("scroll");
+  const form = document.getElementById("form");
+  const input = document.getElementById("input");
+  const send = document.getElementById("send");
+  const empty = document.getElementById("empty");
+  let busy = false;
+  // One id per page load; the server uses it to remember this conversation.
+  const sessionId = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : String(Date.now()) + Math.random().toString(16).slice(2);
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  // Minimal formatting: **bold**, `code`, line breaks. Input is escaped first.
+  function format(text) {
+    return escapeHtml(text)
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\n/g, "<br>");
+  }
+  function addMessage(cls, html) {
+    if (empty) empty.remove();
+    const el = document.createElement("div");
+    el.className = "msg " + cls;
+    el.innerHTML = html;
+    thread.appendChild(el);
+    scroller.scrollTop = scroller.scrollHeight;
+    return el;
+  }
+
+  async function ask(text) {
+    if (busy || !text.trim()) return;
+    busy = true; send.disabled = true;
+    addMessage("user", escapeHtml(text));
+    const wait = addMessage("bot", '<div class="status"><span class="dots"><span></span><span></span><span></span></span>Analyzing</div>');
+    try {
+      const res = await fetch(API + "/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, session_id: sessionId }),
+        signal: AbortSignal.timeout(240000)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || ("Request failed (" + res.status + ")"));
+      let html = format(data.reply || "");
+      for (const url of data.chart_urls || []) {
+        html += '<img src="' + API + escapeHtml(url) + '" alt="Price chart with 7-day forecast">';
+      }
+      wait.innerHTML = html;
+    } catch (err) {
+      wait.classList.add("error");
+      wait.textContent = "Could not get an answer. " + (err.name === "TimeoutError" ? "The request timed out." : err.message) +
+        " Check that the API is running and your API key is valid.";
+    } finally {
+      busy = false; send.disabled = false; input.focus();
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  }
+
+  form.addEventListener("submit", e => {
+    e.preventDefault();
+    const text = input.value;
+    input.value = ""; input.style.height = "auto";
+    ask(text);
+  });
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  });
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 140) + "px";
+  });
+  document.querySelectorAll(".examples button").forEach(b =>
+    b.addEventListener("click", () => ask(b.textContent)));
+  document.getElementById("clear").addEventListener("click", () => location.reload());
+</script>
+</body>
+</html>
