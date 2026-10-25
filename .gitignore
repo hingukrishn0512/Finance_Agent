@@ -1,1 +1,4 @@
-project/requirement.txt
+.env
+.venv/
+charts/
+__pycache__/
