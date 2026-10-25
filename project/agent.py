@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import uuid
 import threading
@@ -8,16 +9,14 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-import matplotlib
-matplotlib.use("Agg")  # no popup windows; saves to file instead (works for FastAPI too)
-import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 from langchain.tools import tool
 from langchain.agents import create_agent
 from langchain_google_genai import ChatGoogleGenerativeAI
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Input
+
+# NOTE: TensorFlow, scikit-learn and matplotlib are imported INSIDE the forecast
+# functions below, not here. They are heavy, and importing them at startup made the
+# server slow to wake up. Now only the forecast tool pays that cost, when it is used.
 
 load_dotenv(override=True)
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
@@ -37,6 +36,36 @@ def timed(fn):
         finally:
             print(f"[tool] {fn.__name__} finished in {time.time() - t0:.1f}s", flush=True)
     return wrapper
+
+
+# --- small cache ---------------------------------------------------------------
+# "Analyze X" calls several tools that all ask Yahoo for the same data. Remembering
+# each answer for 5 minutes makes those requests faster and avoids rate limits.
+
+CACHE_SECONDS = 300
+_cache = {}
+
+
+def _cached(key, loader):
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < CACHE_SECONDS:
+        return hit[1]
+    value = loader()
+    is_empty = value.empty if hasattr(value, "empty") else not value
+    if not is_empty:                      # never remember an empty/failed answer
+        if len(_cache) > 200:
+            _cache.clear()
+        _cache[key] = (now, value)
+    return value
+
+
+def get_info(ticker: str) -> dict:
+    return _cached(("info", ticker.upper()), lambda: yf.Ticker(ticker).info or {})
+
+
+def get_history(ticker: str, period: str) -> pd.DataFrame:
+    return _cached(("hist", ticker.upper(), period), lambda: yf.Ticker(ticker).history(period=period))
 
 
 # --- helpers (pure pandas/numpy) ---------------------------------------------
@@ -96,6 +125,136 @@ def statement_lines(df, wanted, max_years=4):
             lines.append(f"  {name}: " + " | ".join(parts))
     return lines or ["  (not available)"]
 
+
+# --- forecasting (LSTM) -------------------------------------------------------
+
+LOOKBACK = 60          # the model looks at the last 60 days to predict the next one
+TEST_FRACTION = 0.2    # the last 20% of days are kept aside and never used for training
+HORIZON = 7            # days to forecast
+
+
+def _make_windows(scaled, lookback):
+    """Turns a price series into (last 60 days -> next day) training examples."""
+    X, y = [], []
+    for i in range(lookback, len(scaled)):
+        X.append(scaled[i - lookback:i, 0])
+        y.append(scaled[i, 0])
+    return np.array(X).reshape(-1, lookback, 1), np.array(y)
+
+
+def compute_metrics(actual, pred, prev):
+    """Accuracy of the model against a naive baseline ("tomorrow = today").
+    actual = real price, pred = model's prediction, prev = the previous day's real price."""
+    actual, pred, prev = (np.asarray(a, dtype=float).ravel() for a in (actual, pred, prev))
+    rmse_model = float(np.sqrt(np.mean((pred - actual) ** 2)))
+    rmse_naive = float(np.sqrt(np.mean((prev - actual) ** 2)))
+    mape = float(np.mean(np.abs((actual - pred) / actual)) * 100)
+    direction = float(np.mean(np.sign(pred - prev) == np.sign(actual - prev)) * 100)
+    improvement = (rmse_naive - rmse_model) / rmse_naive * 100 if rmse_naive else 0.0
+    return {
+        "test_days": int(len(actual)),
+        "rmse_model": rmse_model,
+        "rmse_naive": rmse_naive,
+        "improvement_vs_naive": float(improvement),   # positive = LSTM better than naive
+        "mape": mape,
+        "direction_accuracy": direction,
+    }
+
+
+def run_forecast(prices, horizon: int = HORIZON) -> dict:
+    """Trains an LSTM on the first 80% of the prices, tests it on the last 20% that it
+    never saw, then forecasts the next `horizon` days.
+    (The old version measured error on the same data it trained on, which looks much
+    better than reality. This one reports honest, held-out numbers.)"""
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Input
+    from tensorflow.keras.callbacks import EarlyStopping
+    from sklearn.preprocessing import MinMaxScaler
+
+    np.random.seed(42)
+    tf.random.set_seed(42)          # same data -> same result every run
+
+    prices = np.asarray(prices, dtype=float).reshape(-1, 1)
+    split = int(len(prices) * (1 - TEST_FRACTION))
+
+    scaler = MinMaxScaler()
+    scaler.fit(prices[:split])       # learn the scale from training days only (no peeking)
+    scaled = scaler.transform(prices)
+
+    X, y = _make_windows(scaled, LOOKBACK)
+    target_pos = np.arange(LOOKBACK, len(scaled))   # day each example is predicting
+    is_train = target_pos < split
+    X_train, y_train = X[is_train], y[is_train]
+    X_test = X[~is_train]
+    test_pos = target_pos[~is_train]
+
+    model = Sequential([Input(shape=(LOOKBACK, 1)), LSTM(50), Dense(25), Dense(1)])
+    model.compile(optimizer="adam", loss="mean_squared_error")
+    model.fit(
+        X_train, y_train, batch_size=16, epochs=30, verbose=0, validation_split=0.1,
+        callbacks=[EarlyStopping(patience=5, restore_best_weights=True)],
+    )
+
+    # honest accuracy: predictions on days the model never trained on
+    pred = scaler.inverse_transform(model.predict(X_test, verbose=0)).ravel()
+    actual = prices[test_pos].ravel()
+    prev = prices[test_pos - 1].ravel()
+    metrics = compute_metrics(actual, pred, prev)
+
+    # forecast the next `horizon` days, feeding each prediction back in
+    window = scaled[-LOOKBACK:, 0].tolist()
+    future = []
+    for _ in range(horizon):
+        x_in = np.array(window[-LOOKBACK:]).reshape(1, LOOKBACK, 1)
+        nxt = float(model.predict(x_in, verbose=0)[0, 0])
+        future.append(nxt)
+        window.append(nxt)
+    future_prices = scaler.inverse_transform(np.array(future).reshape(-1, 1)).ravel()
+
+    return {
+        "metrics": metrics,
+        "test_pos": test_pos,
+        "test_pred": pred,
+        "future_prices": future_prices,
+    }
+
+
+def _save_chart(ticker, dates, prices, res):
+    import matplotlib
+    matplotlib.use("Agg")  # no popup windows; saves to a file instead
+    import matplotlib.pyplot as plt
+
+    future_dates = pd.bdate_range(start=dates[-1] + pd.Timedelta(days=1), periods=len(res["future_prices"]))
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(dates, prices, color="blue", label="Actual price")
+    ax.plot(dates[res["test_pos"]], res["test_pred"], color="red", linestyle="--",
+            label="Model prediction (unseen test days)")
+    ax.plot(future_dates, res["future_prices"], color="green", marker="o", label="7-day forecast")
+    ax.set_title(f"{ticker.upper()} LSTM forecast (demo, not advice)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.legend()
+    ax.grid(True)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    path = os.path.join(CHART_DIR, f"{ticker.upper()}_{uuid.uuid4().hex[:8]}.png")
+    fig.savefig(path)
+    plt.close(fig)
+
+    # keep only the 30 newest charts, so the server's disk doesn't fill up
+    files = sorted(
+        (os.path.join(CHART_DIR, f) for f in os.listdir(CHART_DIR) if f.endswith(".png")),
+        key=os.path.getmtime,
+    )
+    for old in files[:-30]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return path, future_dates
+
 # --- end helpers --------------------------------------------------------------
 
 
@@ -106,7 +265,7 @@ def statement_lines(df, wanted, max_years=4):
 @timed
 def get_stock_price(ticker: str) -> str:
     """Return the latest price and daily change of a stock."""
-    hist = yf.Ticker(ticker).history(period="5d")["Close"].dropna()
+    hist = get_history(ticker, "5d")["Close"].dropna()
     if hist.empty:
         return f"No price data found for {ticker.upper()}. Check the ticker symbol (e.g. RELIANCE.NS)."
     price = float(hist.iloc[-1])
@@ -119,7 +278,7 @@ def get_stock_price(ticker: str) -> str:
 @timed
 def get_stock_history(ticker: str) -> str:
     """Return the last 10 trading days of open/high/low/close/volume."""
-    history = yf.Ticker(ticker).history(period="1mo")
+    history = get_history(ticker, "1mo")
     if history.empty:
         return f"No history found for {ticker.upper()}."
     tail = history[["Open", "High", "Low", "Close", "Volume"]].tail(10).round(2)
@@ -131,7 +290,7 @@ def get_stock_history(ticker: str) -> str:
 def analyze_price_history(ticker: str) -> str:
     """Analyze up to 5 years of price history: returns over 1m/3m/6m/1y/3y/5y,
     annual volatility, max drawdown, 50/200-day moving averages, RSI(14), 52-week range."""
-    close = yf.Ticker(ticker).history(period="5y")["Close"]
+    close = get_history(ticker, "5y")["Close"]
     if close.dropna().empty:
         return f"No history found for {ticker.upper()}."
     a = analyze_prices(close)
@@ -157,7 +316,7 @@ def analyze_price_history(ticker: str) -> str:
 @timed
 def get_company_info(ticker: str) -> str:
     """Return company name, sector, industry, country, website and business summary."""
-    info = yf.Ticker(ticker).info
+    info = get_info(ticker)
     summary = (info.get("longBusinessSummary") or "N/A")[:600]
     return (
         f"Company info for {ticker.upper()}:\n"
@@ -174,7 +333,7 @@ def get_company_info(ticker: str) -> str:
 def get_key_ratios(ticker: str) -> str:
     """Return valuation and quality ratios (P/E, P/B, ROE, margins, debt/equity, dividend yield,
     beta, market cap, 52-week range) and analyst target prices/recommendation."""
-    info = yf.Ticker(ticker).info
+    info = get_info(ticker)
     cur = info.get("financialCurrency") or info.get("currency") or ""
     dy = info.get("dividendYield")
     # newer yfinance returns dividendYield already in percent, older returns a fraction
@@ -200,7 +359,7 @@ def get_key_ratios(ticker: str) -> str:
 def get_financials(ticker: str) -> str:
     """Return up to 4 years of annual income statement, balance sheet and cash flow highlights."""
     stock = yf.Ticker(ticker)
-    cur = (stock.info or {}).get("financialCurrency") or ""
+    cur = get_info(ticker).get("financialCurrency") or ""
     parts = [f"Annual financials for {ticker.upper()} (currency: {cur}):"]
     parts.append("Income statement:")
     parts += statement_lines(stock.financials, ["Total Revenue", "Gross Profit", "Operating Income", "EBITDA", "Net Income"])
@@ -221,13 +380,13 @@ def compare_stocks(tickers: str) -> str:
     rows = []
     for sym in symbols:
         try:
-            close = yf.Ticker(sym).history(period="1y")["Close"]
+            close = get_history(sym, "1y")["Close"]
             if close.dropna().empty:
                 rows.append(f"{sym}: no data")
                 continue
             a = analyze_prices(close)
             try:
-                info = yf.Ticker(sym).info
+                info = get_info(sym)
                 pe, mcap = info.get("trailingPE"), info.get("marketCap")
             except Exception:
                 pe, mcap = None, None
@@ -250,7 +409,7 @@ def get_financial_news(ticker: str) -> str:
     base = ticker.split(".")[0]
     query = base
     try:
-        name = yf.Ticker(ticker).info.get("shortName")
+        name = get_info(ticker).get("shortName")
         if name:
             query = f'"{name}"'  # company name gives far better results than a ticker
     except Exception:
@@ -275,68 +434,36 @@ def get_financial_news(ticker: str) -> str:
 @tool
 @timed
 def get_graph(ticker: str) -> str:
-    """Train a small LSTM on 1 year of prices, save a chart of actual vs predicted
-    prices, and forecast the next 7 days. Returns the forecast, chart path and error stats."""
-    stock_history = yf.Ticker(ticker).history(period="1y")
-    close_prices = stock_history["Close"].dropna().values.reshape(-1, 1)
-    dates = stock_history["Close"].dropna().index
-    if len(close_prices) < 100:
-        return f"Not enough price history for {ticker.upper()} to train a forecast."
+    """Train a small LSTM on 2 years of prices, test it on recent days it never saw, save a
+    chart of actual vs predicted prices, and forecast the next 7 days. Returns the forecast,
+    chart path and honest held-out accuracy (RMSE vs a naive baseline, MAPE, direction accuracy)."""
+    stock_history = get_history(ticker, "2y")
+    close = stock_history["Close"].dropna()
+    if len(close) < 200:
+        return f"Not enough price history for {ticker.upper()} to train and test a forecast."
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled = scaler.fit_transform(close_prices)
+    prices = close.values
+    res = run_forecast(prices)
+    chart_path, future_dates = _save_chart(ticker, close.index, prices, res)
+    m = res["metrics"]
 
-    lookback = 60
-    X, y = [], []
-    for i in range(lookback, len(scaled)):
-        X.append(scaled[i - lookback:i, 0])
-        y.append(scaled[i, 0])
-    X, y = np.array(X), np.array(y)
-    X = X.reshape((X.shape[0], X.shape[1], 1))
+    if m["improvement_vs_naive"] > 5:
+        verdict = "The LSTM beats the naive baseline on unseen days."
+    elif m["improvement_vs_naive"] > -5:
+        verdict = "The LSTM is about as accurate as the naive baseline, so it adds little."
+    else:
+        verdict = "The LSTM is WORSE than the naive baseline, so treat this forecast as a demo only."
 
-    model = Sequential([Input(shape=(lookback, 1)), LSTM(50), Dense(25), Dense(1)])
-    model.compile(optimizer="adam", loss="mean_squared_error")
-    model.fit(X, y, batch_size=8, epochs=5, verbose=0)
-
-    preds = scaler.inverse_transform(model.predict(X, verbose=0))
-    actual = close_prices[lookback:]
-    plot_dates = dates[lookback:]
-
-    # Honest accuracy check: compare against the naive "tomorrow = today" baseline
-    rmse_model = float(np.sqrt(np.mean((preds - actual) ** 2)))
-    rmse_naive = float(np.sqrt(np.mean((actual[1:] - actual[:-1]) ** 2)))
-
-    window = scaled[-lookback:, 0].tolist()
-    future = []
-    for _ in range(7):
-        x_in = np.array(window[-lookback:]).reshape(1, lookback, 1)
-        nxt = model.predict(x_in, verbose=0)[0, 0]
-        future.append(nxt)
-        window.append(nxt)
-    future_prices = scaler.inverse_transform(np.array(future).reshape(-1, 1)).flatten()
-    future_dates = [dates[-1] + np.timedelta64(i, "D") for i in range(1, 8)]
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(plot_dates, actual, color="blue", label="Actual Price")
-    ax.plot(plot_dates, preds, color="red", linestyle="--", label="Model fit (training data)")
-    ax.plot(future_dates, future_prices, color="green", marker="o", label="7-Day Forecast")
-    ax.set_title(f"{ticker.upper()} LSTM forecast (demo, not advice)")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Price")
-    ax.legend()
-    ax.grid(True)
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    chart_path = os.path.join(CHART_DIR, f"{ticker.upper()}_{uuid.uuid4().hex[:8]}.png")
-    fig.savefig(chart_path)
-    plt.close(fig)
-
-    forecast_lines = [f"Day {i + 1}: {p:.2f}" for i, p in enumerate(future_prices)]
+    forecast_lines = [f"Day {i + 1} ({d.date()}): {p:.2f}"
+                      for i, (d, p) in enumerate(zip(future_dates, res["future_prices"]))]
     return (
         f"Chart saved at: {chart_path}\n"
         "7-day forecast (rough estimate):\n" + "\n".join(forecast_lines) + "\n"
-        f"Model RMSE on training data: {rmse_model:.2f} vs naive 'tomorrow = today' baseline: {rmse_naive:.2f}. "
-        "If the model is not clearly better than the baseline, the forecast has little predictive value."
+        f"Held-out test on the last {m['test_days']} trading days the model never trained on:\n"
+        f"LSTM RMSE {m['rmse_model']:.2f} vs naive 'tomorrow = today' RMSE {m['rmse_naive']:.2f} "
+        f"({m['improvement_vs_naive']:+.1f}% vs naive; positive = LSTM better) | "
+        f"MAPE {m['mape']:.2f}% | direction accuracy {m['direction_accuracy']:.1f}% (50% = coin flip).\n"
+        f"{verdict}"
     )
 
 
@@ -369,8 +496,9 @@ Rules:
    sections (Business, Valuation, Financial health, Price trend, News, Risks).
 4. For comparisons, use compare_stocks, then add get_key_ratios if more depth is needed.
 5. State the currency and the date of the data when you have it.
-6. For forecasts, use get_graph. Give the 7 numbers, mention the chart path, and tell the user the
-   model's error versus the naive baseline. Say plainly that it is a weak demo, not a prediction to trade on.
+6. For forecasts, use get_graph. Give the 7 numbers, mention the chart path, and report the held-out
+   test results from the tool (RMSE vs the naive baseline, MAPE, direction accuracy) exactly as given,
+   including its verdict. Say plainly that it is a weak demo, not a prediction to trade on.
 7. Give balanced views (strengths and risks). Do not tell the user to buy or sell.
    End full analyses with: "This is not financial advice."
 Keep answers clear and concise."""
@@ -420,9 +548,42 @@ def run_agent(user_input: str, history: list | None = None) -> dict:
     return {"reply": reply, "charts": charts}
 
 
+# ----------------------------- EVALUATION -------------------------
+# Run:  python stock_agent.py --eval            (uses the default tickers)
+#       python stock_agent.py --eval TCS.NS AAPL (or your own tickers)
+# Prints honest held-out results you can quote on your resume (only if they are good).
+
+DEFAULT_EVAL_TICKERS = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "AAPL", "MSFT"]
+
+
+def evaluate_many(tickers=None):
+    tickers = tickers or DEFAULT_EVAL_TICKERS
+    rows = []
+    print(f"{'Ticker':<14}{'Test days':>10}{'LSTM RMSE':>11}{'Naive RMSE':>12}{'vs naive':>10}{'MAPE':>8}{'Direction':>11}")
+    for t in tickers:
+        close = get_history(t, "2y")["Close"].dropna()
+        if len(close) < 200:
+            print(f"{t:<14} skipped (not enough data)")
+            continue
+        m = run_forecast(close.values)["metrics"]
+        rows.append(m)
+        print(f"{t:<14}{m['test_days']:>10}{m['rmse_model']:>11.2f}{m['rmse_naive']:>12.2f}"
+              f"{m['improvement_vs_naive']:>9.1f}%{m['mape']:>7.2f}%{m['direction_accuracy']:>10.1f}%")
+    if rows:
+        avg = lambda k: float(np.mean([r[k] for r in rows]))
+        better = sum(r["improvement_vs_naive"] > 0 for r in rows)
+        print(f"\nAverage over {len(rows)} stocks: {avg('improvement_vs_naive'):+.1f}% RMSE vs naive baseline | "
+              f"MAPE {avg('mape'):.2f}% | direction accuracy {avg('direction_accuracy'):.1f}%")
+        print(f"LSTM beat the naive baseline on {better} of {len(rows)} stocks.")
+
+
 # ----------------------------- CLI -------------------------------
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--eval":
+        evaluate_many(sys.argv[2:] or None)
+        sys.exit(0)
+
     print("enter 'exit' for exiting the loop")
     chat_history = []
     while True:
