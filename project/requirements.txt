@@ -1,3 +1,7 @@
+# API
+fastapi
+uvicorn[standard]
+
 # LLM / agent
 langchain
 langchain-core
@@ -14,7 +18,3 @@ pandas
 tensorflow
 scikit-learn
 matplotlib
-
-# API
-fastapi
-uvicorn[standard]
